@@ -1,0 +1,7 @@
+{
+  "git": {
+    "deploymentEnabled": {
+      "codex/central-contact-adapter": false
+    }
+  }
+}
