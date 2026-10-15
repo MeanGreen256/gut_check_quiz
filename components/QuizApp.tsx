@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { CaptureNotice, useContactCapture, type ContactNotice } from "@/components/ContactCapture";
 import { useSearchParams } from "next/navigation";
 import { track } from "@vercel/analytics";
 import {
@@ -69,13 +70,15 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
-export default function QuizApp() {
+export default function QuizApp({ contactNotice = null }: { contactNotice?: ContactNotice }) {
+  const contactCapture = useContactCapture(contactNotice);
+  const leadPending = useRef(false);
   const searchParams = useSearchParams();
   const devType = searchParams.get("dev") === "results"
     ? (searchParams.get("type") as ResultTypeId | null)
     : null;
   const isDevMode =
-    devType !== null && devType in PROFILES;
+    !contactNotice && devType !== null && devType in PROFILES;
 
   const [stage, setStage] = useState<Stage>("landing");
   const [current, setCurrent] = useState(0); // question index 0–9
@@ -201,6 +204,7 @@ export default function QuizApp() {
 
   async function handleLeadSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (leadPending.current) return;
     let valid = true;
     if (!firstName.trim()) {
       setNameError("Please add your first name.");
@@ -216,7 +220,9 @@ export default function QuizApp() {
     }
     if (!valid) return;
 
+    leadPending.current = true;
     setSubmitting(true);
+    if (contactNotice && !(await contactCapture.capture(email))) { leadPending.current = false; setSubmitting(false); return; }
     fire("email_submitted", { consent });
 
     // Answer pattern for the summary route — no PII
@@ -278,6 +284,7 @@ export default function QuizApp() {
     // Transition to results immediately
     setStage("results");
     fire("result_viewed", { type: resultType });
+    leadPending.current = false;
     setSubmitting(false);
   }
 
@@ -348,6 +355,7 @@ export default function QuizApp() {
               <div className="field">
                 <label htmlFor="first-name">First name</label>
                 <input
+                  disabled={submitting}
                   id="first-name"
                   type="text"
                   autoComplete="given-name"
@@ -366,6 +374,7 @@ export default function QuizApp() {
               <div className="field">
                 <label htmlFor="email">Email</label>
                 <input
+                  disabled={submitting}
                   id="email"
                   type="email"
                   autoComplete="email"
@@ -381,8 +390,11 @@ export default function QuizApp() {
                   </p>
                 )}
               </div>
+              <CaptureNotice notice={contactNotice} />
+              {contactCapture.error && <p role="alert" className="field-error">{contactCapture.error}</p>}
               <div className="check-row">
                 <input
+                  disabled={submitting}
                   id="consent"
                   type="checkbox"
                   checked={consent}
