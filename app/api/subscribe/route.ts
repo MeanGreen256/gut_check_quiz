@@ -1,128 +1,63 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createRateLimiter } from "../../../lib/rate-limit";
 
-const KIT_BASE = "https://api.kit.com/v4";
-
+const limited = createRateLimiter(5);
 const VALID_TYPES = ["thriving", "sensitive", "struggling", "distressed"];
 
-// Tag names must already exist in Kit (created by the owner).
-function tagNameFor(resultType: string): string {
-  return `gut-${resultType}`;
-}
-
-// Module-scope cache of tag name -> id (persists per serverless instance)
-let tagCache: Record<string, number> | null = null;
-
-async function kitFetch(
-  path: string,
-  apiKey: string,
-  init?: RequestInit
-): Promise<Response> {
-  return fetch(`${KIT_BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Kit-Api-Key": apiKey,
-      ...(init?.headers ?? {}),
-    },
-  });
-}
-
-async function getTagId(
-  apiKey: string,
-  tagName: string
-): Promise<number | null> {
-  if (tagCache && tagName in tagCache) return tagCache[tagName];
-
-  const cache: Record<string, number> = {};
-  let cursor: string | null = null;
-  // Paginate defensively (accounts rarely have >few pages of tags)
-  for (let i = 0; i < 10; i++) {
-    const qs = cursor ? `?after=${encodeURIComponent(cursor)}` : "";
-    const res = await kitFetch(`/tags${qs}`, apiKey);
-    if (!res.ok) return null;
-    const data = await res.json();
-    for (const tag of data.tags ?? []) {
-      cache[tag.name] = tag.id;
-    }
-    if (data.pagination?.has_next_page && data.pagination?.end_cursor) {
-      cursor = data.pagination.end_cursor;
-    } else {
-      break;
-    }
-  }
-  tagCache = cache;
-  return cache[tagName] ?? null;
-}
-
 export async function POST(req: NextRequest) {
+  if (limited(req.headers)) return NextResponse.json({ ok: false, error: "rate_limited" }, {
+    status: 429, headers: { "Retry-After": "60" },
+  });
+  let body;
+  try { body = await req.json(); } catch {
+    return NextResponse.json({ ok: false }, { status: 400 });
+  }
+  if (!body || typeof body !== "object" || body.consent !== true ||
+      typeof body.email !== "string" || body.email.length > 254 ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email.trim()) ||
+      typeof body.firstName !== "string" || body.firstName.length > 100 ||
+      !VALID_TYPES.includes(body.resultType)) {
+    return NextResponse.json({ ok: false }, { status: 400 });
+  }
   const apiKey = process.env.CONVERTKIT_API_KEY;
   const formId = process.env.CONVERTKIT_FORM_ID;
+  if (!apiKey || !formId) return NextResponse.json({ ok: false }, { status: 503 });
 
-  if (!apiKey || !formId) {
-    console.error("subscribe: missing CONVERTKIT env vars");
-    return NextResponse.json({ ok: false }, { status: 500 });
-  }
-
-  let body: { firstName?: string; email?: string; resultType?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ ok: false }, { status: 400 });
-  }
-
-  const firstName = (body.firstName ?? "").trim().slice(0, 100);
-  const email = (body.email ?? "").trim().slice(0, 254);
-  const resultType = (body.resultType ?? "").trim();
-
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return NextResponse.json({ ok: false }, { status: 400 });
-  }
-  if (!VALID_TYPES.includes(resultType)) {
-    return NextResponse.json({ ok: false }, { status: 400 });
-  }
-
-  try {
-    // 1. Create (or upsert) the subscriber
-    const createRes = await kitFetch("/subscribers", apiKey, {
-      method: "POST",
-      body: JSON.stringify({
-        email_address: email,
-        first_name: firstName || undefined,
-      }),
+  // One deadline for the entire transaction, including tag pagination and bodies.
+  const signal = AbortSignal.any([req.signal, AbortSignal.timeout(5000)]);
+  const email = body.email.trim();
+  async function kit(path: string, payload?: object) {
+    const response = await fetch(`https://api.kit.com/v4${path}`, {
+      method: payload ? "POST" : "GET", signal, cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Kit-Api-Key": apiKey! },
+      body: payload ? JSON.stringify(payload) : undefined,
     });
-    if (!createRes.ok && createRes.status !== 409) {
-      console.error("subscribe: create subscriber failed", createRes.status);
+    // A conflict is not proof of acceptance. No automatic retries of partial writes.
+    if (!response.ok) throw new Error("provider_rejected");
+    return response;
+  }
+  try {
+    // Resolve configuration before writing. Missing/malformed tags cannot succeed.
+    let tagId: number | undefined;
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const response = await kit(`/tags${cursor ? `?after=${encodeURIComponent(cursor)}` : ""}`);
+      const data = await response.json();
+      if (!Array.isArray(data.tags)) throw new Error("invalid_tags");
+      const tag = data.tags.find((tag: { name?: unknown; id?: unknown }) =>
+        tag?.name === `gut-${body.resultType}` && typeof tag.id === "number" && Number.isSafeInteger(tag.id) && tag.id > 0);
+      if (tag) { tagId = tag.id; break; }
+      if (!data.pagination?.has_next_page) break;
+      if (typeof data.pagination.end_cursor !== "string" || !data.pagination.end_cursor) throw new Error("invalid_cursor");
+      cursor = data.pagination.end_cursor;
     }
-
-    // 2. Add to the form
-    const formRes = await kitFetch(`/forms/${formId}/subscribers`, apiKey, {
-      method: "POST",
-      body: JSON.stringify({ email_address: email }),
-    });
-    if (!formRes.ok) {
-      console.error("subscribe: add to form failed", formRes.status);
-    }
-
-    // 3. Apply the result-type tag
-    const tagId = await getTagId(apiKey, tagNameFor(resultType));
-    if (tagId) {
-      const tagRes = await kitFetch(`/tags/${tagId}/subscribers`, apiKey, {
-        method: "POST",
-        body: JSON.stringify({ email_address: email }),
-      });
-      if (!tagRes.ok) {
-        console.error("subscribe: tag apply failed", tagRes.status);
-      }
-    } else {
-      console.error(
-        `subscribe: tag "${tagNameFor(resultType)}" not found in Kit`
-      );
-    }
-
+    if (!tagId) throw new Error("missing_tag");
+    await kit("/subscribers", { email_address: email, first_name: body.firstName.trim() || undefined });
+    await kit(`/forms/${encodeURIComponent(formId!)}/subscribers`, { email_address: email });
+    await kit(`/tags/${tagId}/subscribers`, { email_address: email });
     return NextResponse.json({ ok: true });
-  } catch (err) {
-    // Never surface errors to the client — results render regardless
-    console.error("subscribe: unexpected error", err);
-    return NextResponse.json({ ok: false }, { status: 502 });
+  } catch {
+    // Do not log provider errors/bodies: they may contain email addresses or keys.
+    return NextResponse.json({ ok: false, error: "unconfirmed" }, { status: signal.aborted ? 504 : 502 });
   }
 }

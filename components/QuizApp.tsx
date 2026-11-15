@@ -87,10 +87,14 @@ export default function QuizApp() {
   const questionHeadingRef = useRef<HTMLHeadingElement>(null);
   const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const generation = useRef(0);
+  useEffect(() => () => { generation.current++; }, []);
+
   // Lead form state
   const [firstName, setFirstName] = useState("");
   const [email, setEmail] = useState("");
   const [consent, setConsent] = useState(false);
+  const [captureStatus, setCaptureStatus] = useState<"idle" | "pending" | "confirmed" | "unconfirmed">("idle");
   const [emailError, setEmailError] = useState<string | null>(null);
   const [nameError, setNameError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -216,6 +220,8 @@ export default function QuizApp() {
     }
     if (!valid) return;
 
+    const run = ++generation.current;
+    setCaptureStatus("idle");
     setSubmitting(true);
     fire("email_submitted", { consent });
 
@@ -230,6 +236,9 @@ export default function QuizApp() {
 
     // Fire subscribe (only with consent) — do not block results on it
     if (consent) {
+      setCaptureStatus("pending");
+      const captureController = new AbortController();
+      const captureTimeout = setTimeout(() => captureController.abort(), 6500);
       fetch("/api/subscribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -237,10 +246,16 @@ export default function QuizApp() {
           firstName: firstName.trim(),
           email: email.trim(),
           resultType,
+          consent: true,
         }),
+        signal: captureController.signal,
+      }).then(async (response) => {
+        const data = response.ok ? await response.json() : null;
+        if (generation.current !== run) return;
+        setCaptureStatus(data?.ok === true ? "confirmed" : "unconfirmed");
       }).catch(() => {
-        /* silent — results always render */
-      });
+        if (generation.current === run) setCaptureStatus("unconfirmed");
+      }).finally(() => clearTimeout(captureTimeout));
     }
 
     // Personalized summary, in parallel, 6s budget
@@ -259,12 +274,14 @@ export default function QuizApp() {
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         clearTimeout(timeout);
+        if (generation.current !== run) return;
         if (data && typeof data.summary === "string" && data.summary.trim()) {
           if (reducedMotion) {
             setPersonalSummary(data.summary.trim());
           } else {
             setSummaryFading(true);
             setTimeout(() => {
+              if (generation.current !== run) return;
               setPersonalSummary(data.summary.trim());
               setSummaryFading(false);
             }, 300);
@@ -273,7 +290,7 @@ export default function QuizApp() {
       })
       .catch(() => {
         /* silent — static summary stays */
-      });
+      }).finally(() => clearTimeout(timeout));
 
     // Transition to results immediately
     setStage("results");
@@ -282,6 +299,8 @@ export default function QuizApp() {
   }
 
   function handleRetake() {
+    generation.current++;
+    setCaptureStatus("idle");
     fire("retake_clicked");
     if (advanceTimer.current) clearTimeout(advanceTimer.current);
     setStage("landing");
@@ -417,6 +436,11 @@ export default function QuizApp() {
 
       {stage === "results" && (
         <main className="stage" style={{ justifyContent: "flex-start" }}>
+          {captureStatus !== "idle" && <p role="status" aria-live="polite">
+            {captureStatus === "pending" ? "Submitting your newsletter signup…" : captureStatus === "confirmed"
+              ? "Your newsletter signup was accepted. Check your inbox for any confirmation steps."
+              : "We couldn’t confirm your newsletter signup. It may be partially processed. Your quiz results are ready below."}
+          </p>}
           <ResultsScreen
             score={finalScore}
             type={resultType}
