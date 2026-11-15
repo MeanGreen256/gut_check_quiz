@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { createRateLimiter } from "../../../lib/rate-limit";
 
 const VALID_TYPES = ["thriving", "sensitive", "struggling", "distressed"];
 
@@ -14,29 +15,7 @@ const TYPE_CONTEXT: Record<string, string> = {
     "Distressed Gut (0–39): significant, frequent symptoms that deserve professional attention. Highest urgency, still warm and non-alarmist.",
 };
 
-// Simple in-memory rate limit: 10 requests/minute per IP.
-// Per-instance on serverless, which is sufficient basic protection for the key.
-const WINDOW_MS = 60_000;
-const MAX_PER_WINDOW = 10;
-const hits = new Map<string, number[]>();
-
-function rateLimited(ip: string): boolean {
-  const now = Date.now();
-  const arr = (hits.get(ip) ?? []).filter((t) => now - t < WINDOW_MS);
-  if (arr.length >= MAX_PER_WINDOW) {
-    hits.set(ip, arr);
-    return true;
-  }
-  arr.push(now);
-  hits.set(ip, arr);
-  // Opportunistic cleanup
-  if (hits.size > 5000) {
-    for (const [k, v] of hits) {
-      if (v.every((t) => now - t >= WINDOW_MS)) hits.delete(k);
-    }
-  }
-  return false;
-}
+const rateLimited = createRateLimiter(10);
 
 export async function POST(req: NextRequest) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -44,10 +23,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "unavailable" }, { status: 500 });
   }
 
-  const ip =
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
-  if (rateLimited(ip)) {
-    return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+  if (rateLimited(req.headers)) {
+    return NextResponse.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "60" } });
   }
 
   let body: {
@@ -61,6 +38,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
 
+  if (!body || typeof body !== "object") return NextResponse.json({ error: "bad_request" }, { status: 400 });
   const { resultType, score, answers } = body;
   if (
     !resultType ||
@@ -69,7 +47,7 @@ export async function POST(req: NextRequest) {
     score < 0 ||
     score > 100 ||
     !answers ||
-    typeof answers !== "object"
+    typeof answers !== "object" || Array.isArray(answers)
   ) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
@@ -82,7 +60,7 @@ export async function POST(req: NextRequest) {
     .join("\n");
 
   try {
-    const anthropic = new Anthropic({ apiKey });
+    const anthropic = new Anthropic({ apiKey, timeout: 4500, maxRetries: 0 });
     const message = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 300,
@@ -103,7 +81,7 @@ export async function POST(req: NextRequest) {
           content: `Result type: ${resultType}\nScore: ${score}/100\n\nAnswer pattern:\n${answerLines}`,
         },
       ],
-    });
+    }, { signal: AbortSignal.any([req.signal, AbortSignal.timeout(4500)]) });
 
     const text =
       message.content[0]?.type === "text" ? message.content[0].text.trim() : "";
@@ -111,8 +89,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "empty" }, { status: 502 });
     }
     return NextResponse.json({ summary: text });
-  } catch (err) {
-    console.error("summary: API error", err);
+  } catch {
     return NextResponse.json({ error: "upstream" }, { status: 502 });
   }
 }

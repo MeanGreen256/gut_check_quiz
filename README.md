@@ -29,4 +29,22 @@ QA shortcut: `/?dev=results&type=thriving|sensitive|struggling|distressed` rende
 
 - Contrast audit (spec §11) required two token adjustments: `--ink-soft` #7A7480 → #6E6874 (4.28 → 5.10 vs 4.5:1 AA) and `--type-sensitive` #C98A2B → #A0701A (2.77 → 4.11 vs 3:1 for large text/strokes). All other tokens pass as specced.
 - Primary button text renders at 19px/700 so white-on-pink qualifies as WCAG large text (4.18:1 > 3:1), keeping the exact brand pink.
-- Kit tags `gut-thriving`, `gut-sensitive`, `gut-struggling`, `gut-distressed` must exist in the Kit account; the subscribe route looks up tag IDs by name at runtime and caches them.
+- Kit tags `gut-thriving`, `gut-sensitive`, `gut-struggling`, `gut-distressed` must exist in the Kit account; the subscribe route looks up tag IDs by name at runtime before writing.
+
+## Reliability checks
+
+Run `npm ci`, `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`.
+CI runs these without provider credentials. Tests mock Kit and Anthropic; they do
+not establish acceptance by a live provider.
+
+Newsletter consent remains unchecked. Results render immediately even if capture
+fails. Signup is confirmed only after tag lookup and all three Kit writes return
+success. Partial writes and timeouts are reported as unconfirmed, without retrying
+or claiming rollback. Kit has a 5-second total deadline; optional AI has a 4.5-second
+deadline and no SDK retries. Static summaries remain the fallback.
+
+Both endpoints use bounded, per-instance rate limits (5 signup / 10 summary
+requests per minute). These are best-effort abuse mitigation, not distributed
+quotas: cold starts and multiple instances have separate budgets. On Vercel the
+platform's forwarded IP header identifies clients; elsewhere clients share a
+bucket. No paid storage or access/security configuration is added.
